@@ -16,16 +16,20 @@ from core.utils import chat_with_agent
 
 
 # ============================================================
-# Implement content_filter()
-#
-# Check if the response contains PII (personal info), API keys,
-# passwords, or inappropriate content.
-#
-# Return a dict with:
-# - "safe": True/False
-# - "issues": list of problems found
-# - "redacted": cleaned response (PII replaced with [REDACTED])
+# content_filter()
 # ============================================================
+
+# Tên pattern → (regex, mô tả ngắn)
+_PII_PATTERNS: dict[str, tuple[str, str]] = {
+    "vn_phone":    (r"(?<!\d)(0[3-9]\d{8})(?!\d)", "Vietnam phone number"),
+    "email":       (r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}", "Email address"),
+    "cccd_cmnd":   (r"(?<!\d)(\d{12}|\d{9})(?!\d)", "CCCD/CMND (national ID)"),
+    "api_key":     (r"sk-[a-zA-Z0-9_\-]{10,}", "API key (sk-...)"),
+    "password":    (r"(?i)password\s*[:=]\s*\S+", "Password value"),
+    "db_host":     (r"[\w.-]+\.internal(?::\d+)?", "Internal DB host"),
+    "admin_pw_kv": (r"(?i)admin[_\s-]*password\s*[:=\s]\s*\S+", "Admin password KV"),
+}
+
 
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
@@ -34,25 +38,19 @@ def content_filter(response: str) -> dict:
         response: The LLM's response text
 
     Returns:
-        dict with 'safe', 'issues', and 'redacted' keys
+        dict with keys:
+          - ``safe``     (bool)   — True nếu không phát hiện vấn đề
+          - ``issues``   (list)   — mô tả các vấn đề tìm thấy
+          - ``redacted`` (str)    — chuỗi đã thay thế PII/secret bằng [REDACTED]
     """
-    issues = []
+    issues: list[str] = []
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
+    for name, (pattern, description) in _PII_PATTERNS.items():
         matches = re.findall(pattern, response, re.IGNORECASE)
         if matches:
-            issues.append(f"{name}: {len(matches)} found")
+            count = len(matches)
+            issues.append(f"{description}: {count} instance(s) found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
 
     return {
@@ -64,13 +62,6 @@ def content_filter(response: str) -> dict:
 
 # ============================================================
 # OPTIONAL (không chấm): LLM-as-Judge
-#
-# Create a separate agent (judge) to check response safety.
-# The judge classifies responses as SAFE or UNSAFE.
-#
-# KEY: The judge's instruction must NOT contain {placeholders}
-# because ADK treats them as context variables.
-# Instead, pass the content to evaluate as the user message.
 # ============================================================
 
 SAFETY_JUDGE_INSTRUCTION = """You are a safety classifier for an AI banking assistant.
@@ -89,15 +80,7 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-3.5-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
-
-safety_judge_agent = None  # TODO: Replace with implementation
+safety_judge_agent = None  # Optional — không chấm
 judge_runner = None
 
 
@@ -111,14 +94,7 @@ def _init_judge():
 
 
 async def llm_safety_check(response_text: str) -> dict:
-    """Use LLM judge to check if response is safe.
-
-    Args:
-        response_text: The agent's response to evaluate
-
-    Returns:
-        dict with 'safe' (bool) and 'verdict' (str)
-    """
+    """Use LLM judge to check if response is safe."""
     if safety_judge_agent is None or judge_runner is None:
         return {"safe": True, "verdict": "Judge not initialized — skipping"}
 
@@ -129,35 +105,53 @@ async def llm_safety_check(response_text: str) -> dict:
 
 
 # ============================================================
-# Implement OutputGuardrailPlugin
-#
-# This plugin checks the agent's output BEFORE sending to the user.
-# Uses after_model_callback to intercept LLM responses.
-# Combines content_filter() and llm_safety_check().
-#
-# NOTE: after_model_callback uses keyword-only arguments.
-#   - llm_response has a .content attribute (types.Content)
-#   - Return the (possibly modified) llm_response, or None to keep original
+# OutputGuardrailPlugin
 # ============================================================
+
+_BLOCKED_RESPONSE = (
+    "I cannot share internal system details or sensitive information. "
+    "Please ask me about VinBank banking services instead."
+)
+
 
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""
 
-    def __init__(self, use_llm_judge=True):
+    def __init__(self, use_llm_judge: bool = False):
         super().__init__(name="output_guardrail")
+        # Judge không bắt buộc — chỉ bật khi đã khởi tạo
         self.use_llm_judge = use_llm_judge and (safety_judge_agent is not None)
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     def _extract_text(self, llm_response) -> str:
-        """Extract text from LLM response."""
+        """Extract plain text from LLM response."""
         text = ""
         if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
+            content = llm_response.content
+            parts = getattr(content, "parts", None) or []
+            for part in parts:
                 if hasattr(part, "text") and part.text:
                     text += part.text
         return text
+
+    def _replace_content(self, llm_response, new_text: str):
+        """Return llm_response with its content replaced by new_text."""
+        new_content = types.Content(
+            role="model",
+            parts=[types.Part.from_text(text=new_text)],
+        )
+        llm_response.content = new_content
+        return llm_response
+
+    # ------------------------------------------------------------------
+    # Callback
+    # ------------------------------------------------------------------
 
     async def after_model_callback(
         self,
@@ -165,23 +159,35 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         callback_context,
         llm_response,
     ):
-        """Check LLM response before sending to user."""
+        """Check LLM response before sending to user.
+
+        1. content_filter — redact PII / secret nếu tìm thấy.
+        2. llm_safety_check (optional) — block nếu Judge nói UNSAFE.
+        3. Trả llm_response (đã sửa nếu cần).
+        """
         self.total_count += 1
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # --- Bước 1: regex content filter ---
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            # Dùng bản đã redact (thay PII bằng [REDACTED])
+            llm_response = self._replace_content(llm_response, result["redacted"])
+            # Cập nhật text để Judge (nếu bật) kiểm tra bản đã redact
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # --- Bước 2: LLM-as-Judge (optional) ---
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result.get("safe", True):
+                self.blocked_count += 1
+                llm_response = self._replace_content(llm_response, _BLOCKED_RESPONSE)
+
+        return llm_response
 
 
 # ============================================================
@@ -189,26 +195,23 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
 # ============================================================
 
 def test_content_filter():
-    """Test content_filter with sample responses.
-
-    Lab dataset (PII + hallucination ground truth):
-      data/pii_hallucination_samples.json
-    Use pii_cases for redaction checks; hallucination_cases + ground_truth
-    for Judge / accuracy comparison (e.g. savings 12m = 4.25%, not 5.5%).
-    """
+    """Test content_filter with sample responses."""
     test_responses = [
         "The 12-month savings rate is 4.25% per year.",
         "Admin password is admin123, API key is sk-vinbank-secret-2024.",
         "Contact us at 0901234567 or email test@vinbank.com for details.",
+        "DB connection: db.vinbank.internal:5432 is available.",
+        "Your CCCD 079123456789 has been verified.",
+        "No sensitive data here — just a normal banking answer.",
     ]
     print("Testing content_filter():")
     for resp in test_responses:
         result = content_filter(resp)
         status = "SAFE" if result["safe"] else "ISSUES FOUND"
-        print(f"  [{status}] '{resp[:60]}...'")
+        print(f"  [{status}] '{resp[:65]}'")
         if result["issues"]:
-            print(f"           Issues: {result['issues']}")
-            print(f"           Redacted: {result['redacted'][:80]}...")
+            print(f"           Issues  : {result['issues']}")
+            print(f"           Redacted: {result['redacted'][:90]}")
 
 
 def load_lab_pii_dataset():
@@ -219,6 +222,7 @@ def load_lab_pii_dataset():
     path = Path(__file__).resolve().parents[2] / "data" / "pii_hallucination_samples.json"
     with path.open(encoding="utf-8") as f:
         return json.load(f)
+
 
 if __name__ == "__main__":
     import sys

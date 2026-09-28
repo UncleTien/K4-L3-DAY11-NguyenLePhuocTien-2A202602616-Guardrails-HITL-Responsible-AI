@@ -139,6 +139,9 @@ def get_red_provider() -> str:
     ).strip().lower()
     if raw in {"gemini", "google", "adk"}:
         return PROVIDER_GEMINI
+    # openrouter as Red provider → treated as openai SDK (OpenAI-compatible)
+    if raw == PROVIDER_OPENROUTER:
+        return PROVIDER_OPENROUTER
     return PROVIDER_OPENAI
 
 
@@ -148,6 +151,12 @@ def get_red_model() -> str:
         return (
             os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
             or DEFAULT_GEMINI_MODEL
+        )
+    # openrouter red: default to gpt-4o-mini:free
+    if get_red_provider() == PROVIDER_OPENROUTER:
+        return (
+            os.environ.get("OPENAI_MODEL", "openai/gpt-4o-mini:free").strip()
+            or "openai/gpt-4o-mini:free"
         )
     return (
         os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip()
@@ -170,6 +179,15 @@ def get_openai_api_key() -> str:
 
 
 def red_openai_client_kwargs() -> dict:
+    if get_red_provider() == PROVIDER_OPENROUTER:
+        # Dùng OpenAI SDK trỏ vào OpenRouter — key là OPENROUTER_API_KEY
+        return {
+            "api_key": get_openrouter_api_key() or None,
+            "base_url": (
+                os.environ.get("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL).strip()
+                or OPENROUTER_BASE_URL
+            ),
+        }
     return {"api_key": get_openai_api_key() or None}
 
 
@@ -180,7 +198,7 @@ def red_provider_label(tier: str = "advance") -> str:
 
 
 def red_uses_openai_sdk() -> bool:
-    return get_red_provider() == PROVIDER_OPENAI
+    return get_red_provider() in (PROVIDER_OPENAI, PROVIDER_OPENROUTER)
 
 
 def red_uses_gemini() -> bool:
